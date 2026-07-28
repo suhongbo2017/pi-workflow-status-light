@@ -1,0 +1,11 @@
+.pio/
+.pioenvs/
+.piolibdeps/
+__pycache__/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+build/
+pi-extension/node_modules/

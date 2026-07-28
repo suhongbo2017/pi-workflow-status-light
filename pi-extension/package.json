@@ -1,0 +1,8 @@
+{
+  "name": "ai-traffic-light",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "mqtt": "^5.10.0"
+  }
+}
