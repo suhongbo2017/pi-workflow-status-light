@@ -16,8 +16,8 @@
 |---------|------|---------|------|
 | 扩展加载完成 | init | 紫色呼吸 | Pi 启动中 |
 | 会话开始 / 空闲 | idle | 蓝色常亮 | 等待用户输入 |
-| 用户提交提示词，AI 开始处理 | running | 黄色闪烁 | AI 正在工作 |
-| AI 完成所有工具调用 | done | 绿色常亮 | 任务完成，3秒后→idle |
+| 用户提交提示词，AI 开始处理 | running | 黄色跑马灯 | AI 正在工作 |
+| AI 完成所有处理（`agent_settled`） | done | 绿色常亮 | 任务完成，3秒后→idle |
 | 工具执行出错 | error | 红色常亮 | 出错，3秒后→idle |
 | 会话关闭 | idle | 蓝色常亮 | 会话结束 |
 
@@ -38,7 +38,7 @@
 3. 事件监听：
    - `session_start` → 发 idle
    - `agent_start` → 发 running
-   - `agent_end` → 发 done → 3s 后 → idle
+   - `agent_settled` → 发 done → 3s 后 → idle（使用 agent_settled 而非 agent_end，因为 Pi 可能在 agent_end 后 auto-retry）
    - `tool_result`（isError=true）→ 发 error → 3s 后 → idle
    - `session_shutdown` → 发 idle + 关闭 MQTT 连接
 4. 消息格式：JSON `{"state":"running", "message":"AI 处理中"}`

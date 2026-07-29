@@ -7,9 +7,13 @@
  * 状态映射:
  *   init       → 紫色呼吸  (Pi 启动)
  *   idle       → 蓝色常亮  (等待用户输入)
- *   running    → 黄色闪烁  (AI 正在处理中)
+ *   running    → 黄色跑马灯  (AI 正在处理中)
  *   done       → 绿色常亮  (任务完成，3秒后→idle)
  *   error      → 红色常亮  (工具执行出错，3秒后恢复前一个状态)
+ *
+ * 事件说明:
+ *   agent_end  → 仅记录日志，不切换 LED（Pi 可能 auto-retry/auto-compact）
+ *   agent_settled → 真正完成，切换 DONE 状态（Pi 不会再自动继续）
  *
  * 硬件: ESP32-S3 + 3x WS2812B (已实现所有状态效果)
  * MQTT: broker.emqx.io:1883, topic: ai/status / ai/led/command
@@ -184,14 +188,19 @@ export default async function (pi: ExtensionAPI) {
     publishState(STATES.RUNNING, "AI 处理中");
   });
 
-  // 5. AI 完成所有处理 → 完成（绿色常亮，3秒后→idle）
+  // 5. agent_end 仅记录（不改变 LED，因为 Pi 可能还会 auto-retry/auto-compact）
   pi.on("agent_end", async () => {
-    console.log("[AI红绿灯] agent_end 触发");
+    console.log("[AI红绿灯] agent_end 触发（等待 settled）");
+  });
+
+  // 6. agent_settled — Pi 不会再自动继续 → 完成（绿色常亮，3秒后→idle）
+  pi.on("agent_settled", async () => {
+    console.log("[AI红绿灯] agent_settled 触发 — 所有处理完成");
     isAgentRunning = false;
     setTempState(STATES.DONE, "任务完成", TEMP_STATE_DURATION_MS);
   });
 
-  // 6. 工具执行出错 → 错误（红色常亮，3秒后恢复）
+  // 7. 工具执行出错 → 错误（红色常亮，3秒后恢复）
   pi.on("tool_result", async (event) => {
     if (event.isError) {
       console.log("[AI红绿灯] 工具执行出错");
@@ -199,7 +208,7 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  // 7. 会话关闭 → 空闲 + 清理 MQTT 连接
+  // 8. 会话关闭 → 空闲 + 清理 MQTT 连接
   pi.on("session_shutdown", async () => {
     isAgentRunning = false;
     if (tempStateTimer) {
@@ -215,8 +224,8 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  // 8. 兜底：每 30 秒检查是否卡在 running 状态
-  // 如果上一次 agent_end 没触发，手动恢复
+  // 9. 兜底：每 30 秒检查是否卡在 running 状态
+  // 如果上一次 agent_settled 没触发，手动恢复
   setInterval(() => {
     if (mqttClient && mqttClient.connected && lastState === STATES.RUNNING && !isAgentRunning) {
       console.log("[AI红绿灯] 兜底检测：卡在 running 但 agent 已结束，恢复 idle");

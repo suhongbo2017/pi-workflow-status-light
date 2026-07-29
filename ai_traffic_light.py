@@ -78,7 +78,7 @@ class TrafficLight:
         return self.set_state("idle", message)
     
     def running(self, message: str = "Processing..."):
-        """Yellow blink - AI workflow running"""
+        """Yellow chase (跑马灯) - AI workflow running"""
         return self.set_state("running", message)
     
     def waiting(self, message: str = "Waiting for input..."):
