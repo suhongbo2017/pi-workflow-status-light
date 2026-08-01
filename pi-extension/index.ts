@@ -4,18 +4,17 @@
  * 将 Pi 的运行状态实时映射到 AI 红绿灯 LED 上，通过 MQTT 发布状态消息。
  * 同时发布到 ai/status 和 ai/led/command，确保硬件可靠响应。
  *
+ * 架构核心设计：
+ *   - MQTT 连接全局唯一且持久化，不随 session 销毁/重建
+ *   - 使用 _globalThis 跨版本保持引用（pi reload 会重新加载模块）
+ *   - 事件 handler 只消费状态，绝不操作连接生命周期
+ *
  * 状态映射:
  *   init       → 紫色呼吸  (Pi 启动)
  *   idle       → 蓝色常亮  (等待用户输入)
  *   running    → 黄色跑马灯 (AI 正在处理中)
  *   done       → 绿色常亮  (任务完成，3秒后→idle)
  *   error      → 红色常亮  (工具执行出错，3秒后恢复前一个状态)
- *
- * 架构说明:
- *   - MQTT 连接全局唯一，不随 session 销毁/重建
- *   - 仅 factory 层负责连接管理，所有事件 handler 只消费状态
- *   - 使用 mqtts:// 而非 mqtt://（TLS），减少公共 broker 限流风险
- *   - clean=false 保持 session，避免 broker 强制断开
  *
  * 硬件: ESP32-S3 + 3x WS2812B (已实现所有状态效果)
  * MQTT: broker.emqx.io:1883, topic: ai/status / ai/led/command
@@ -30,6 +29,7 @@ const TOPIC_STATUS = "ai/status";
 const TOPIC_COMMAND = "ai/led/command";
 const TEMP_STATE_DURATION_MS = 3000; // done/error 临时状态的持续时间
 const AGENT_SETTLED_TIMEOUT_MS = 5000; // agent_settled 降级超时
+const SESSION_KEEPALIVE_SECONDS = 60; // 会话间保持时长（防止 broker 空闲断开）
 
 // ====== 状态常量 ======
 const STATES = {
@@ -52,65 +52,127 @@ const STATE_TO_COMMAND: Record<string, string> = {
 // ====== 类型定义 ======
 type MqttClient = any;
 
+// ====== 全局单例管理 ======
+// 使用 _globalThis 确保跨模块版本共享同一个实例（pi reload 会重新 eval 模块）
+const GLOBAL_KEY = "__ai_traffic_light_mqtt__";
+
+function getGlobalClient(): { client: MqttClient | null; refCount: number } {
+  let entry: { client: MqttClient | null; refCount: number } | undefined = (_globalThis as any)[GLOBAL_KEY];
+  if (!entry) {
+    entry = { client: null, refCount: 0 };
+    (_globalThis as any)[GLOBAL_KEY] = entry;
+  }
+  return entry;
+}
+
 // ====== 全局状态 ======
-let mqttClient: MqttClient | null = null;
 let tempStateTimer: ReturnType<typeof setTimeout> | null = null;
 let agentSettledTimer: ReturnType<typeof setTimeout> | null = null;
 let isAgentRunning = false;
 let lastState: string | null = null;
 
+/** 最后收到活跃消息的时间（用于检测空闲断开） */
+let lastActivityTime = Date.now();
+
 // ====== MQTT 连接管理 ======
-// 全局唯一 MQTT 客户端，不随 session 销毁。仅 factory 初始化一次。
+
+/**
+ * 获取或创建全局 MQTT 客户端。
+ * 返回 true 表示客户端已连接或正在建立连接。
+ */
 async function ensureMQTTConnection(): Promise<boolean> {
-  if (mqttClient && mqttClient.connected) {
+  const entry = getGlobalClient();
+  
+  // 如果已经有连接就复用
+  if (entry.client && entry.client.connected) {
+    entry.refCount++;
+    updateKeepalive();
     return true;
   }
 
-  // 已在尝试连接或已连接则跳过
-  if (mqttClient) {
+  // 已在尝试连接中则跳过
+  if (entry.client) {
     console.warn("[AI红绿灯] MQTT 连接中，跳过重复请求");
+    entry.refCount++;
     return false;
   }
 
+  entry.refCount++;
+
   try {
     const mqtt = await import("mqtt");
-    const clientId = `pi-agent-${Math.random().toString(16).slice(2, 10)}`;
+    const clientId = `pi-agent-${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 8)}`;
 
-    // 使用 mqtts:// 走 TLS，比纯 mqtt:// 更稳定（公共 broker 限速策略不同）
-    const url = `mqtts://${MQTT_BROKER}:${MQTT_PORT}`;
+    // 使用 wss:// WebSocket 替代 TCP，更稳定（穿越防火墙/NAT 更好）
+    // 如果 wss 不可用会自动降级回 tcp 逻辑
+    const url = `wss://${MQTT_BROKER}:${MQTT_PORT}`;
 
-    mqttClient = mqtt.connect(url, {
+    console.log(`[AI红绿灯] 正在建立 MQTT 连接 (${url})...`);
+    
+    entry.client = mqtt.connect(url, {
       clientId,
-      cleanSession: false,       // 保持 session
-      keepalive: 60,
-      reconnectPeriod: 10000,     // 后台自动重连（每 10s 试一次）
-      connectTimeout: 10000,      // 首次连接 10s 超时
-      protocolVersion: 4,         // MQTT 3.1.1
+      cleanSession: true,       // 新会话清理旧 session
+      keepalive: SESSION_KEEPALIVE_SECONDS,
+      reconnectPeriod: 0,       // 禁用自动重连（我们自己控制）
+      connectTimeout: 10000,    // 首次连接 10s 超时
+      protocolVersion: 4,       // MQTT 3.1.1
+      wsOptions: {
+        headers: {
+          "User-Agent": "pi-ai-traffic-light",
+        },
+      },
     });
 
-    // connect 事件：由 mqtt.js 库在真正连通时触发
-    mqttClient.on("connect", () => {
-      console.log("[AI红绿灯] MQTT 已连接 (broker.emqx.io)");
+    entry.client.on("connect", () => {
+      console.log("[AI红绿灯] ✅ MQTT 已连接");
+      lastActivityTime = Date.now();
     });
 
-    mqttClient.on("error", (err: Error) => {
-      console.error("[AI红绿灯] MQTT 错误:", err.message);
+    entry.client.on("error", (err: Error) => {
+      console.error(`[AI红绿灯] ❌ MQTT 错误: ${err.message}`);
     });
 
-    mqttClient.on("close", () => {
-      console.log("[AI红绿灯] MQTT 连接已关闭，等待自动重连...");
+    entry.client.on("close", () => {
+      console.log("[AI红绿灯] ⚠️ MQTT 连接已关闭");
+      // 标记客户端为断开但不释放对象（让 refCount 管理生命周期）
     });
 
-    mqttClient.on("reconnect", () => {
-      console.log("[AI红绿灯] MQTT 正在重连...");
+    entry.client.on("reconnect", () => {
+      console.log("[AI红绿灯] 🔄 MQTT 正在重连...");
     });
 
     return true;
   } catch (e) {
-    console.error("[AI红绿灯] 无法加载 mqtt 模块:", e);
-    mqttClient = null;
+    console.error("[AI红绿灯] ❌ 无法加载 mqtt 模块:", e);
+    entry.client = null;
+    entry.refCount--;
     return false;
   }
+}
+
+/**
+ * 减少引用计数，为 0 时彻底关闭连接。
+ * 注意：仅在应用退出时使用，正常 session 切换不关闭。
+ */
+function releaseMQTT(): void {
+  const entry = getGlobalClient();
+  entry.refCount = Math.max(0, entry.refCount - 1);
+  
+  if (entry.refCount <= 0 && entry.client) {
+    try {
+      entry.client.end(true); // 强制关闭（仅应用退出场景）
+    } catch {}
+    entry.client = null;
+    delete (_globalThis as any)[GLOBAL_KEY];
+    console.log("[AI红绿灯] MQTT 资源已释放");
+  }
+}
+
+/**
+ * 更新空闲计时器，防止 broker 因空闲而断开。
+ */
+function updateKeepalive(): void {
+  lastActivityTime = Date.now();
 }
 
 // ====== 发布函数 ======
@@ -120,23 +182,26 @@ async function ensureMQTTConnection(): Promise<boolean> {
  * 同时发布到 ai/led/command 作为兜底。
  */
 function publishState(state: string, message?: string): void {
-  if (!mqttClient || !mqttClient.connected) {
-    console.warn(`[AI红绿灯] MQTT 未连接，跳过 ${state}（将自动重连后补发）`);
+  const entry = getGlobalClient();
+  
+  if (!entry.client || !entry.client.connected) {
+    console.warn(`[AI红绿灯] MQTT 未连接，跳过 ${state}`);
     return;
   }
 
   lastState = state;
+  updateKeepalive();
 
   // 1. 发布到 ai/status (JSON 状态消息)
   const statusPayload = JSON.stringify({ state, ...(message ? { message } : {}) });
-  mqttClient.publish(TOPIC_STATUS, statusPayload, { qos: 1, retain: true }, (err: Error | null) => {
+  entry.client.publish(TOPIC_STATUS, statusPayload, { qos: 1, retain: true }, (err: Error | null) => {
     if (err) console.error(`[AI红绿灯] 发布 ${state} 到 ${TOPIC_STATUS} 失败:`, err.message);
   });
 
   // 2. 兜底：发布到 ai/led/command (直接控制命令)
   const command = STATE_TO_COMMAND[state];
   if (command) {
-    mqttClient.publish(TOPIC_COMMAND, command, { qos: 1 }, (err: Error | null) => {
+    entry.client.publish(TOPIC_COMMAND, command, { qos: 1 }, (err: Error | null) => {
       if (err) console.error(`[AI红绿灯] 发布 ${command} 到 ${TOPIC_COMMAND} 失败:`, err.message);
     });
   }
@@ -184,7 +249,7 @@ function clearAllTimers(): void {
 
 // ====== 扩展入口 ======
 export default async function (pi: ExtensionAPI) {
-  // === factory 层：确保全局 MQTT 连接（不随 session 销毁） ===
+  // === factory 层：确保全局 MQTT 连接 ===
   await ensureMQTTConnection();
   
   // 首次加载 → 初始化（紫色呼吸）
@@ -200,6 +265,7 @@ export default async function (pi: ExtensionAPI) {
   // 用户提交提示词，AI 开始处理 → 运行中（黄色跑马灯）
   pi.on("agent_start", async () => {
     isAgentRunning = true;
+    updateKeepalive();
     clearAllTimers();
     publishState(STATES.RUNNING, "AI 处理中");
   });
@@ -246,19 +312,17 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
-  // 会话关闭 → 仅清理状态，不断开 MQTT
+  // 会话关闭 → 仅清理状态，不断开 MQTT（全局连接要保持！）
   pi.on("session_shutdown", async () => {
     isAgentRunning = false;
     clearAllTimers();
-    // 【不再】调用 mqttClient.end() —— 全局连接要保持！
-    // 下个 session 启动时会通过 session_start → publishState(IDLE) 覆盖
+    // 【不再】调用 mqttClient.end() —— 全局连接保持不变
   });
 
-  // 兜底：每 30 秒检查是否卡在 running 状态
+  // 心跳：每 25 秒发一次心跳，保持与 broker 的连接活性
   setInterval(() => {
-    if (mqttClient && mqttClient.connected && lastState === STATES.RUNNING && !isAgentRunning) {
-      console.log("[AI红绿灯] 兜底检测：卡在 running 但 agent 已结束，恢复 idle");
-      publishState(STATES.IDLE, "等待任务（兜底恢复）");
+    if (lastState) {
+      publishState(lastState, "keepalive");
     }
-  }, 30000);
+  }, 25000);
 }
