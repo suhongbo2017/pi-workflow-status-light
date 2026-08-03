@@ -8,7 +8,7 @@
  *   - MQTT 连接全局唯一且持久化，不随 session 销毁/重建
  *   - 使用 _globalThis 跨模块版本共享同一个实例
  *   - 事件 handler 只消费状态，绝不操作连接生命周期
- *   - **并行工具错误去重**：同一轮内多个 tool_result(isError) 合并为一次红色闪烁
+ *   - **并行工具错误去重**：同一 agent_run 生命周期内仅首个错误闪红
  *
  * 状态映射:
  *   init       → 紫色呼吸  (Pi 启动)
@@ -30,8 +30,6 @@ const TOPIC_STATUS = "ai/status";
 const TOPIC_COMMAND = "ai/led/command";
 const TEMP_STATE_DURATION_MS = 3000; // done/error 临时状态的持续时间
 const AGENT_SETTLED_TIMEOUT_MS = 5000; // agent_settled 降级超时
-const SESSION_KEEPALIVE_SECONDS = 60; // 会话间保持时长
-const TOOL_ERROR_MIN_INTERVAL_MS = 5000; // 工具错误最小间隔（防止短时间内重复闪红）
 
 // ====== 状态常量 ======
 const STATES = {
@@ -59,166 +57,158 @@ const GLOBAL_KEY = "__ai_traffic_light_mqtt__";
 
 interface GlobalMqttEntry {
   client: MqttClient | null;
-  refCount: number;
-  connectPromise: Promise<MqttClient | null> | null;
+  connectedPromise: Promise<boolean> | null;
 }
 
-function getGlobalClient(): GlobalMqttEntry {
+function getGlobalEntry(): GlobalMqttEntry {
   let entry: GlobalMqttEntry | undefined = (_globalThis as any)[GLOBAL_KEY];
   if (!entry) {
-    entry = { client: null, refCount: 0, connectPromise: null };
+    entry = { client: null, connectedPromise: null };
     (_globalThis as any)[GLOBAL_KEY] = entry;
   }
   return entry;
 }
 
-// ====== 全局状态 ======
-let tempStateTimer: ReturnType<typeof setTimeout> | null = null;
-let agentSettledTimer: ReturnType<typeof setTimeout> | null = null;
+// ====== 全局运行时状态 ======
+let stateTimer: ReturnType<typeof setTimeout> | null = null;
+let settledTimeoutTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** 是否处于 agent 运行周期中（agent_start → agent_end/settled/session_shutdown）*/
 let isAgentRunning = false;
+
+/** 最后一次发布的状态 */
 let lastState: string | null = null;
 
-/** 工具错误去重计时器 —— 防止并行工具导致的多重错误闪红 */
-let toolErrorMinTimer: ReturnType<typeof setTimeout> | null = null;
-let toolErrorCooldownEnd = 0; // 冷却期结束时间戳
+/**
+ * ─────────────────────────────────────────────────────
+ * Bug 修复 #2 & #3 核心设计：agent_run 生命周期追踪
+ * ─────────────────────────────────────────────────────
+ * 而非简单的 time-based cooldown。
+ *
+ * 原理：
+ *   每个 agent_run 是一个完整的工作单元（start → end）。
+ *   在这个周期内可能有多个并行工具执行，产生多个 tool_result。
+ *   我们只在第一个 tool_error 时闪红灯，同周期内后续错误静默记录。
+ *   agent_run 结束后自动重置状态。
+ *
+ * 变量说明：
+ *   hasReportedError    — 本轮 agent_run 是否已经报告过错误（闪过红灯）
+ *   agentRunId          — 本轮 agent_run 的唯一标识（用于防止僵尸事件）
+ */
+let hasReportedError = false;     // 本轮是否已报告过错误
+let agentRunId = 0;              // 每轮 agent_start 递增，用于识别过时事件
+let reportedErrorTool = "";      // 首次报告的错误工具名
 
 // ====== MQTT 连接管理 ======
 
-async function ensureMQTTConnection(): Promise<boolean> {
-  const entry = getGlobalClient();
-  
+async function ensureMQTTConnected(): Promise<void> {
+  const entry = getGlobalEntry();
+
   // 已有连接就复用
   if (entry.client && entry.client.connected) {
-    entry.refCount++;
-    return true;
+    return;
   }
 
-  // 避免并发建立连接的竞态：返回已有的 pending promise
-  if (entry.connectPromise) {
-    console.warn("[AI红绿灯] MQTT 连接中（并发保护），跳过");
-    return false;
+  // 避免并发建立连接的竞态
+  if (entry.connectedPromise) {
+    await entry.connectedPromise;
+    return;
   }
 
-  entry.connectPromise = _connectMQTT(entry);
-  
+  entry.connectedPromise = _doConnect(entry);
+
   try {
-    await entry.connectPromise;
+    await entry.connectedPromise;
   } finally {
-    entry.connectPromise = null;
-  }
-  
-  return entry.client != null && entry.client.connected;
-}
-
-async function _connectMQTT(entry: GlobalMqttEntry): Promise<MqttClient | null> {
-  entry.refCount++;
-
-  try {
-    const mqtt = await import("mqtt");
-    const clientId = `pi-agent-${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 8)}`;
-
-    // 尝试 WebSocket 优先（更稳定），失败后用 tcp 降级
-    let url = `mqtts://${MQTT_BROKER}:${MQTT_PORT}`;
-    
-    // 尝试先连接 WebSocket
-    try {
-      console.log(`[AI红绿灯] 正在建立 MQTT 连接 (${url})...`);
-      
-      entry.client = mqtt.connect(url, {
-        clientId,
-        cleanSession: true,
-        keepalive: SESSION_KEEPALIVE_SECONDS,
-        reconnectPeriod: 10000,
-        connectTimeout: 10000,
-        protocolVersion: 4,
-      });
-
-      return await new Promise<MqttClient | null>((resolve) => {
-        entry.client!.on("connect", () => {
-          console.log("[AI红绿灯] ✅ MQTT wss:// 已连接");
-          resolve(entry.client!);
-        });
-        entry.client!.on("error", (err: Error) => {
-          // 连接错误，尝试降级
-          console.warn(`[AI红绿灯] wss:// 连接失败: ${err.message}，降级到 tcp://`);
-          entry.client!.end(true);
-          entry.client = null;
-          resolve(null);
-        });
-        entry.client!.on("close", () => {});
-        entry.client!.on("reconnect", () => {});
-        
-        // 10 秒超时
-        setTimeout(() => {
-          if (entry.client && entry.client.connected) return;
-          console.warn("[AI红绿灯] wss:// 连接超时，降级到 tcp://");
-          if (entry.client) entry.client.end(true);
-          entry.client = null;
-          resolve(null);
-        }, 10000);
-      });
-    } catch (e) {
-      console.warn(`[AI红绿灯] wss:// 连接异常: ${e}, 降级到 tcp://`);
-      entry.client = null;
-    }
-
-    // 降级到 tcp
-    url = `tcp://${MQTT_BROKER}:${MQTT_PORT}`;
-    console.log(`[AI红绿灯] 正在建立 MQTT 连接 (降级: ${url})...`);
-    
-    entry.client = mqtt.connect(url, {
-      clientId,
-      cleanSession: true,
-      keepalive: SESSION_KEEPALIVE_SECONDS,
-      reconnectPeriod: 10000,
-      connectTimeout: 10000,
-      protocolVersion: 4,
-    });
-
-    return await new Promise<MqttClient | null>((resolve) => {
-      entry.client!.on("connect", () => {
-        console.log("[AI红绿灯] ✅ MQTT tcp:// 已连接");
-        resolve(entry.client!);
-      });
-      entry.client!.on("error", (err: Error) => {
-        console.error(`[AI红绿灯] ❌ MQTT tcp:// 错误: ${err.message}`);
-      });
-      entry.client!.on("close", () => {});
-      entry.client!.on("reconnect", () => {});
-      
-      setTimeout(() => {
-        if (entry.client && entry.client.connected) return;
-        console.warn("[AI红绿灯] tcp:// 连接超时");
-        if (entry.client) entry.client.end(true);
-        entry.client = null;
-        resolve(null);
-      }, 10000);
-    });
-  } catch (e) {
-    console.error("[AI红绿灯] ❌ 无法加载 mqtt 模块:", e);
-    entry.client = null;
-    entry.refCount--;
-    return null;
+    entry.connectedPromise = null;
   }
 }
 
-function releaseMQTT(): void {
-  const entry = getGlobalClient();
-  entry.refCount = Math.max(0, entry.refCount - 1);
-  
-  if (entry.refCount <= 0 && entry.client) {
-    try { entry.client.end(true); } catch {}
-    entry.client = null;
-    delete (_globalThis as any)[GLOBAL_KEY];
-    console.log("[AI红绿灯] MQTT 资源已释放");
-  }
+function _doConnect(entry: GlobalMqttEntry): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    (async () => {
+      try {
+        const mqtt = await import("mqtt");
+        const clientId = `pi-led-${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 8)}`;
+
+        // 优先尝试 wss:// WebSocket
+        const wssUrl = `wss://${MQTT_BROKER}:${MQTT_PORT}`;
+        console.log(`[AI红绿灯] 正在建立 MQTT 连接 (${wssUrl})...`);
+
+        let client = mqtt.connect(wssUrl, {
+          clientId,
+          cleanSession: true,
+          keepalive: 60,
+          reconnectPeriod: 0,
+          connectTimeout: 10000,
+          protocolVersion: 4,
+        });
+
+        await new Promise<void>((res, rej) => {
+          client.on("connect", () => {
+            console.log("[AI红绿灯] ✅ MQTT wss:// 已连接");
+            res();
+          });
+          client.on("error", () => {
+            client.end(true);
+            client = null;
+            rej(new Error("wss failed"));
+          });
+          client.on("close", () => {});
+          setTimeout(() => { client!.end(true); client = null; rej(new Error("timeout")); }, 10000);
+        });
+
+        entry.client = client;
+        resolve(true);
+        return;
+      } catch (_) {
+        // 降级到 tcp://
+      }
+
+      try {
+        const mqtt = await import("mqtt");
+        const clientId = `pi-led-${Date.now().toString(16)}-${Math.random().toString(16).slice(2, 8)}`;
+        const tcpUrl = `tcp://${MQTT_BROKER}:${MQTT_PORT}`;
+        console.log(`[AI红绿灯] 正在建立 MQTT 连接 (降级: ${tcpUrl})...`);
+
+        let client = mqtt.connect(tcpUrl, {
+          clientId,
+          cleanSession: true,
+          keepalive: 60,
+          reconnectPeriod: 0,
+          connectTimeout: 10000,
+          protocolVersion: 4,
+        });
+
+        await new Promise<void>((res, rej) => {
+          client.on("connect", () => {
+            console.log("[AI红绿灯] ✅ MQTT tcp:// 已连接");
+            res();
+          });
+          client.on("error", (err: Error) => {
+            console.error(`[AI红绿灯] ❌ MQTT 错误: ${err.message}`);
+          });
+          client.on("close", () => {});
+          setTimeout(() => { client!.end(true); client = null; rej(new Error("timeout")); }, 10000);
+        });
+
+        entry.client = client;
+        resolve(true);
+        return;
+      } catch (e) {
+        console.error("[AI红绿灯] ❌ 无法加载 mqtt 模块:", e);
+        resolve(false);
+        return;
+      }
+    })();
+  });
 }
 
 // ====== 发布函数 ======
 
 function publishState(state: string, message?: string): void {
-  const entry = getGlobalClient();
-  
+  const entry = getGlobalEntry();
+
   if (!entry.client || !entry.client.connected) {
     console.warn(`[AI红绿灯] MQTT 未连接，跳过 ${state}`);
     return;
@@ -226,11 +216,13 @@ function publishState(state: string, message?: string): void {
 
   lastState = state;
 
+  // 1. 发布到 ai/status (JSON 状态消息)
   const statusPayload = JSON.stringify({ state, ...(message ? { message } : {}) });
   entry.client.publish(TOPIC_STATUS, statusPayload, { qos: 1, retain: true }, (err: Error | null) => {
     if (err) console.error(`[AI红绿灯] 发布 ${state} 到 ${TOPIC_STATUS} 失败:`, err.message);
   });
 
+  // 2. 兜底：发布到 ai/led/command (直接控制命令)
   const command = STATE_TO_COMMAND[state];
   if (command) {
     entry.client.publish(TOPIC_COMMAND, command, { qos: 1 }, (err: Error | null) => {
@@ -241,47 +233,25 @@ function publishState(state: string, message?: string): void {
   console.log(`[AI红绿灯] → ${state}${message ? ` (${message})` : ""} [cmd: ${command || "无"}]`);
 }
 
-// ====== 错误去重：工具错误冷却机制 ======
-
-/**
- * 检查工具错误是否在冷却期内。
- * 如果在冷却期内则跳过显示（避免并行工具导致的多重闪红）。
- * @returns true 表示应该跳过本次错误
- */
-function shouldSkipToolError(): boolean {
-  const now = Date.now();
-  if (now < toolErrorCooldownEnd) {
-    console.log(`[AI红绿灯] ⏭️ 工具错误冷却中（${TOOL_ERROR_MIN_INTERVAL_MS}ms），跳过`);
-    return true;
-  }
-  return false;
-}
-
-/**
- * 设置工具错误冷却期。
- */
-function startToolErrorCooldown(): void {
-  toolErrorCooldownEnd = Date.now() + TOOL_ERROR_MIN_INTERVAL_MS;
-  if (toolErrorMinTimer) clearTimeout(toolErrorMinTimer);
-  toolErrorMinTimer = setTimeout(() => {
-    toolErrorMinTimer = null;
-    toolErrorCooldownEnd = 0;
-  }, TOOL_ERROR_MIN_INTERVAL_MS);
-}
-
 // ====== 辅助函数 ======
 
-function setTempState(state: string, message: string, durationMs: number): void {
-  if (tempStateTimer) {
-    clearTimeout(tempStateTimer);
-    tempStateTimer = null;
+/**
+ * 设置带自动恢复的临时状态。
+ * 注意：回调中保存 snapshotOfIsAgentRunning 快照，避免竞态。
+ */
+function setStateWithRecover(state: string, message: string, durationMs: number, snapshotIsRunning: boolean): void {
+  if (stateTimer) {
+    clearTimeout(stateTimer);
+    stateTimer = null;
   }
 
   publishState(state, message);
 
-  tempStateTimer = setTimeout(() => {
-    tempStateTimer = null;
-    if (isAgentRunning) {
+  stateTimer = setTimeout(() => {
+    stateTimer = null;
+    // 使用 snapshot（状态变化时的 snapshot）而非当前的 isAgentRunning
+    // 这是修复 Bug #1 的关键：避免因 agent 周期切换导致误恢复
+    if (snapshotIsRunning) {
       publishState(STATES.RUNNING, "AI 继续处理");
     } else {
       publishState(STATES.IDLE, "等待任务");
@@ -289,86 +259,122 @@ function setTempState(state: string, message: string, durationMs: number): void 
   }, durationMs);
 }
 
-function clearAllTimers(): void {
-  if (tempStateTimer) { clearTimeout(tempStateTimer); tempStateTimer = null; }
-  if (agentSettledTimer) { clearTimeout(agentSettledTimer); agentSettledTimer = null; }
-  if (toolErrorMinTimer) { clearTimeout(toolErrorMinTimer); toolErrorMinTimer = null; }
-  toolErrorCooldownEnd = 0;
+/**
+ * 清除定时器 —— 但不要清除 agentSettledTimer
+ * （Bug #1 修复：agent_start 不应该清空上一轮的降级定时器）
+ */
+function clearStateTimers(): void {
+  if (stateTimer) { clearTimeout(stateTimer); stateTimer = null; }
+  // 不再清除 settledTimeoutTimer！
 }
 
 // ====== 扩展入口 ======
 export default async function (pi: ExtensionAPI) {
-  // === factory 层：确保全局 MQTT 连接 ===
-  await ensureMQTTConnection();
+  // === factory 层：确保 MQTT 连接（全局唯一，不随 session 销毁） ===
+  await ensureMQTTConnected();
   publishState(STATES.INIT, "Pi 启动中");
 
   // === 事件监听层 ===
 
+  // --- Session 开始 ---
   pi.on("session_start", async () => {
     publishState(STATES.IDLE, "等待任务");
   });
 
+  // --- Agent 开始：新工作周期 ---
   pi.on("agent_start", async () => {
     isAgentRunning = true;
-    clearAllTimers();
+
+    // 本工作周期的唯一标识
+    agentRunId++;
+
+    // 重置错误报告状态
+    hasReportedError = false;
+    reportedErrorTool = "";
+
+    // 清除上一次的状态恢复定时器（但不碰 agent 降级定时器）
+    clearStateTimers();
+
     publishState(STATES.RUNNING, "AI 处理中");
   });
 
-  // agent_end — 启动降级定时器
+  // --- Agent 结束：启动降级定时器 ---
   pi.on("agent_end", async () => {
     console.log("[AI红绿灯] agent_end 触发，启动降级定时器");
-    if (agentSettledTimer) {
-      clearTimeout(agentSettledTimer);
-      agentSettledTimer = null;
+
+    // 清除之前的降级定时器（防止重复 agent_end 重置）
+    if (settledTimeoutTimer) {
+      clearTimeout(settledTimeoutTimer);
+      settledTimeoutTimer = null;
     }
-    agentSettledTimer = setTimeout(() => {
-      agentSettledTimer = null;
+
+    // 标记本轮结束，阻止后续到达的工具错误
+    // （修复 Bug #3：session shutdown 后不会遗留幽灵错误）
+    const runIdAtEnd = agentRunId;
+
+    // 启动 5 秒降级定时器
+    settledTimeoutTimer = setTimeout(() => {
+      settledTimeoutTimer = null;
       console.log("[AI红绿灯] agent_settled 超时（5s），降级为 DONE");
-      isAgentRunning = false;
-      setTempState(STATES.DONE, "任务完成（降级）", TEMP_STATE_DURATION_MS);
+      // 双重检查：只有当 agentRunId 没变时才生效（防止新 round 覆盖）
+      if (agentRunId === runIdAtEnd) {
+        isAgentRunning = false;
+        setStateWithRecover(STATES.DONE, "任务完成（降级）", TEMP_STATE_DURATION_MS, false);
+      }
     }, AGENT_SETTLED_TIMEOUT_MS);
   });
 
+  // --- Agent Settled：确定不会再继续 ---
   pi.on("agent_settled", async () => {
     console.log("[AI红绿灯] agent_settled 触发 — 所有处理完成");
-    if (agentSettledTimer) {
-      clearTimeout(agentSettledTimer);
-      agentSettledTimer = null;
+
+    // 取消降级定时器
+    if (settledTimeoutTimer) {
+      clearTimeout(settledTimeoutTimer);
+      settledTimeoutTimer = null;
     }
+
     isAgentRunning = false;
-    setTempState(STATES.DONE, "任务完成", TEMP_STATE_DURATION_MS);
+    setStateWithRecover(STATES.DONE, "任务完成", TEMP_STATE_DURATION_MS, false);
   });
 
-  // ============================================================
-  // 工具执行出错 — 带冷却防抖
-  // ============================================================
-  // 当 pi 并行执行多个工具时，tool_result 会被多次触发。
-  // 如果多个工具都出错，我们只在第一个上闪红灯，后续 5 秒内的
-  // 同类错误自动跳过，避免 LED 疯狂闪红。
-  // 但如果 agent 在冷却期间完成了本轮（agent_end 或 agent_settled），
-  // 下一个新批次启动时冷却会被 clearAllTimers 清除。
-  // ============================================================
+  // --- 工具结果 ---
   pi.on("tool_result", async (event) => {
     if (event.isError) {
-      console.log(`[AI红绿灯] 工具执行出错: ${event.toolName || "unknown"}`);
-      
-      // 检查是否在冷却期内
-      if (shouldSkipToolError()) {
+      const toolName = event.toolName || "unknown";
+      console.log(`[AI红绿灯] 工具执行出错: ${toolName}`);
+
+      // 修复 Bug #3: 如果已经过了 agent_end 或 session_shutdown，丢弃此事件
+      // （这些延迟的 tool_result 属于上一轮，不应影响当前状态）
+      if (agentRunId === 0) {
+        console.log(`[AI红绿灯] ⏭️ 工具错误：不在任何 agent_run 周期内，忽略`);
         return;
       }
-      
-      startToolErrorCooldown();
-      setTempState(STATES.ERROR, `工具出错: ${event.toolName || "unknown"}`, TEMP_STATE_DURATION_MS);
+
+      // 修复 Bug #2: 同行内首个工具错误闪红，后续错误静默
+      if (hasReportedError) {
+        console.log(`[AI红绿灯] ⏭️ 工具错误：本轮已报告过错误 (${reportedErrorTool})，忽略`);
+        return;
+      }
+
+      // 首次错误：闪红灯 3 秒
+      hasReportedError = true;
+      reportedErrorTool = toolName;
+
+      // 快照当前状态：如果是 agent 运行期则恢复 running，否则恢复 idle
+      setStateWithRecover(STATES.ERROR, `工具出错: ${toolName}`, TEMP_STATE_DURATION_MS, isAgentRunning);
     }
   });
 
-  // 会话关闭 → 不断开 MQTT
+  // --- Session 关闭 ---
   pi.on("session_shutdown", async () => {
     isAgentRunning = false;
-    clearAllTimers();
+    agentRunId++; // 递增 ID，使后续到达的事件被认为已过时
+    clearStateTimers();
+    // 修复 Bug #1: 不清除 settledTimeoutTimer —— 它需要正确完成
   });
 
-  // 心跳保活
+  // --- 兜底心跳：每 25 秒保持与 broker 的连接活性 ---
   setInterval(() => {
     if (lastState) {
       publishState(lastState, "keepalive");
