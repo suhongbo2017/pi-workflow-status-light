@@ -237,9 +237,16 @@ function publishState(state: string, message?: string): void {
 
 /**
  * 设置带自动恢复的临时状态。
- * 注意：回调中保存 snapshotOfIsAgentRunning 快照，避免竞态。
+ * 内部捕获当时的 agentRunId 作为版本戳。当 timer 到期时检查版本号——
+ * 如果当前版本号与快照不一致，说明已经进入了新的 agent_run（或被 settle 覆盖），
+ * 此时放弃自动恢复，由新的事件链接管状态流转。
+ *
+ * @param state         — 要设置的临时状态
+ * @param message       — 状态消息
+ * @param durationMs    — 持续时间
+ * @param snapshotRunId — 拍下的 agent_run 版本号（用于过期检测）
  */
-function setStateWithRecover(state: string, message: string, durationMs: number, snapshotIsRunning: boolean): void {
+function setStateWithRecover(state: string, message: string, durationMs: number, snapshotRunId: number): void {
   if (stateTimer) {
     clearTimeout(stateTimer);
     stateTimer = null;
@@ -249,13 +256,14 @@ function setStateWithRecover(state: string, message: string, durationMs: number,
 
   stateTimer = setTimeout(() => {
     stateTimer = null;
-    // 使用 snapshot（状态变化时的 snapshot）而非当前的 isAgentRunning
-    // 这是修复 Bug #1 的关键：避免因 agent 周期切换导致误恢复
-    if (snapshotIsRunning) {
-      publishState(STATES.RUNNING, "AI 继续处理");
-    } else {
-      publishState(STATES.IDLE, "等待任务");
+    // 核心修复: 用版本号判断 timer 是否仍然有效
+    // 如果当前 agentRunId != 快照值 → 本轮已结束，放弃恢复
+    if (agentRunId !== snapshotRunId) {
+      console.log(`[AI红绿灯] ⏭️ 状态恢复 timer 已过期（run ${snapshotRunId} → 现在 ${agentRunId}），丢弃`);
+      return;
     }
+    // 快照时处于运行期则恢复 running，否则恢复 idle
+    publishState(isAgentRunning ? STATES.RUNNING : STATES.IDLE, isAgentRunning ? "AI 继续处理" : "等待任务");
   }, durationMs);
 }
 
@@ -319,7 +327,7 @@ export default async function (pi: ExtensionAPI) {
       // 双重检查：只有当 agentRunId 没变时才生效（防止新 round 覆盖）
       if (agentRunId === runIdAtEnd) {
         isAgentRunning = false;
-        setStateWithRecover(STATES.DONE, "任务完成（降级）", TEMP_STATE_DURATION_MS, false);
+        setStateWithRecover(STATES.DONE, "任务完成（降级）", TEMP_STATE_DURATION_MS, runIdAtEnd);
       }
     }, AGENT_SETTLED_TIMEOUT_MS);
   });
@@ -335,7 +343,7 @@ export default async function (pi: ExtensionAPI) {
     }
 
     isAgentRunning = false;
-    setStateWithRecover(STATES.DONE, "任务完成", TEMP_STATE_DURATION_MS, false);
+    setStateWithRecover(STATES.DONE, "任务完成", TEMP_STATE_DURATION_MS, agentRunId);
   });
 
   // --- 工具结果 ---
@@ -361,8 +369,8 @@ export default async function (pi: ExtensionAPI) {
       hasReportedError = true;
       reportedErrorTool = toolName;
 
-      // 快照当前状态：如果是 agent 运行期则恢复 running，否则恢复 idle
-      setStateWithRecover(STATES.ERROR, `工具出错: ${toolName}`, TEMP_STATE_DURATION_MS, isAgentRunning);
+      // 快照当前 agent_runId，timer到期时检查是否仍属于本轮
+      setStateWithRecover(STATES.ERROR, `工具出错: ${toolName}`, TEMP_STATE_DURATION_MS, agentRunId);
     }
   });
 
