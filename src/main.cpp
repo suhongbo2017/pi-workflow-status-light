@@ -118,11 +118,10 @@ void connectWiFi() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(g_config.wifiSsid, g_config.wifiPassword);
     
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 40) {
-        delay(250);
-        Serial.print(".");
-        attempts++;
+    // 非阻塞等待最多10秒（每次yield 10ms，期间LED仍可更新）
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+        delay(10);
     }
     
     if (WiFi.status() == WL_CONNECTED) {
@@ -130,12 +129,10 @@ void connectWiFi() {
         Serial.printf("[WiFi] IP 地址: %s\n", WiFi.localIP().toString().c_str());
         g_wifiConnected = true;
         g_offlineMode = false;
-        // 恢复亮度
-        g_ledEngine.setGlobalBrightness(25);
-        g_stateMachine.setBrightnessMultiplier(25);
-        Serial.println("[LED] 亮度已恢复 10%");
+        g_ledEngine.setGlobalBrightness(20);   // 8% 亮度
+        g_stateMachine.setBrightnessMultiplier(20);
     } else {
-        Serial.println(" 失败!");
+        Serial.println(" 超时失败!");
         g_wifiConnected = false;
     }
 }
@@ -268,9 +265,8 @@ bool connectMQTT() {
         g_criticalTriggered = false;
         g_offlineMode = false;
         
-        // 恢复亮度
-        g_ledEngine.setGlobalBrightness(25);
-        g_stateMachine.setBrightnessMultiplier(25);
+        g_ledEngine.setGlobalBrightness(20);   // 8% 亮度
+        g_stateMachine.setBrightnessMultiplier(20);
         
         // 订阅 topic（QoS 1, 会收到 Retained 消息）
         g_mqttClient.subscribe(TOPIC_STATUS, 1);
@@ -293,15 +289,16 @@ bool connectMQTT() {
 
 // ====== 发布心跳 ======
 void publishHeartbeat() {
-    JsonDocument doc;
-    doc["state"] = "heartbeat";
+    // 未连接时直接返回，避免无效内存分配
+    if (!g_mqttClient.connected()) return;
     
-    String payload;
-    serializeJson(doc, payload);
-    
-    bool ok = g_mqttClient.publish(TOPIC_HEARTBEAT, payload.c_str(), false);
+    char payload[32];
+    snprintf(payload, sizeof(payload), "{\"state\":\"heartbeat\"}");
+    bool ok = g_mqttClient.publish(TOPIC_HEARTBEAT, payload, false);
     if (ok) {
         Serial.printf("[MQTT] 心跳已发送\n");
+    } else {
+        Serial.printf("[MQTT] 心跳发送失败 rc=%d\n", g_mqttClient.state());
     }
 }
 
@@ -309,9 +306,8 @@ void publishHeartbeat() {
 void enterOfflineMode() {
     if (!g_offlineMode) {
         g_offlineMode = true;
-        Serial.println("[系统] 进入离线模式 — 亮度降至 10%");
-        g_ledEngine.setGlobalBrightness(5);   // 离线时降到 2%
-        g_stateMachine.setBrightnessMultiplier(5);
+        Serial.println("[系统] 进入离线模式");
+        g_ledEngine.setGlobalBrightness(3);   // 离线时极低亮度
         // 重新应用当前效果（带降低的亮度）
         g_ledEngine.setEffect(g_stateMachine.getCurrentEffect());
     }
@@ -321,9 +317,9 @@ void enterOfflineMode() {
 void exitOfflineMode() {
     if (g_offlineMode) {
         g_offlineMode = false;
-        Serial.println("[系统] 退出离线模式 — 亮度恢复 10%");
-        g_ledEngine.setGlobalBrightness(25);
-        g_stateMachine.setBrightnessMultiplier(25);
+        Serial.println("[系统] 退出离线模式");
+        g_ledEngine.setGlobalBrightness(20);
+        g_stateMachine.setBrightnessMultiplier(20);
         g_ledEngine.setEffect(g_stateMachine.getCurrentEffect());
     }
 }
@@ -348,8 +344,8 @@ void setup() {
 
     // 初始化 LED
     g_ledEngine.begin();
-    g_ledEngine.setGlobalBrightness(25);
-    Serial.printf("[LED] FastLED 初始化完成 | 灯珠: %d | GPIO: %d | 亮度: 10%%\n", NUM_LEDS, LED_DATA_PIN);
+    g_ledEngine.setGlobalBrightness(20);   // 8% 亮度
+    Serial.printf("[LED] FastLED 初始化完成 | 灯珠: %d | GPIO: %d\n", NUM_LEDS, LED_DATA_PIN);
 
     // 初始状态: 紫色呼吸 (初始化中)
     g_stateMachine.setState(WorkflowState::INIT);
@@ -436,7 +432,10 @@ void loop() {
             // ====== 心跳 ======
             if (now - g_lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
                 g_lastHeartbeatMs = now;
-                publishHeartbeat();
+                // 双重检查确保连接仍有效（回调可能在两次心跳间隔间断开）
+                if (g_mqttClient.connected()) {
+                    publishHeartbeat();
+                }
             }
         }
     }

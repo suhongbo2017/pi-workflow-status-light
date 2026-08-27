@@ -2,8 +2,7 @@
 #include <math.h>
 
 LEDEffectsEngine::LEDEffectsEngine()
-    : m_lastUpdateMs(0)
-    , m_useCustomColors(false)
+    : m_useCustomColors(false)
     , m_globalBrightness(25)
 {
     // 初始化 LED 数组为黑色
@@ -133,21 +132,34 @@ void LEDEffectsEngine::renderAlternate(const LEDEffect& effect, unsigned long no
 }
 
 void LEDEffectsEngine::renderChase(const LEDEffect& effect, unsigned long now) {
-    // 跑马灯效果：灯珠从左到右依次点亮
-    // 位置 = (time / 每颗灯珠时长) % 灯珠数量
-    uint16_t slotMs = effect.periodMs / NUM_LEDS;
-    uint8_t pos = (now / slotMs) % NUM_LEDS;
+    // 渐变流水灯：光斑宽度 ~3 颗灯，平滑余弦过渡
+    // pos 从 0 流动到 NUM_LEDS，完整一轮回绕 = effect.periodMs
+    float pos = ((float)(now % effect.periodMs) / (float)effect.periodMs) 
+                * (float)NUM_LEDS;
     
-    // 使用 color2 作为尾迹颜色（如果未设置则用黑色）
-    CRGB trailColor = (effect.color2.r == 0 && effect.color2.g == 0 && effect.color2.b == 0)
-        ? CRGB::Black
-        : effect.color2;
+    CRGB baseColor = effect.color1;
+    const float SPREAD = 3.0f;  // 光斑宽度（核心发光范围）
     
     for (int i = 0; i < NUM_LEDS; i++) {
-        if (i == pos) {
-            m_leds[i] = effect.color1;  // 当前点亮灯珠
+        float dist = (float)i - pos;
+        // 包裹距离
+        if (dist > (float)NUM_LEDS / 2.0f) dist -= (float)NUM_LEDS;
+        if (dist < -(float)NUM_LEDS / 2.0f) dist += (float)NUM_LEDS;
+        
+        uint8_t brightness;
+        if (dist >= SPREAD) {
+            // 远处：显示尾迹色或熄灭
+            CRGB trailColor = (effect.color2.r == 0 && effect.color2.g == 0 && effect.color2.b == 0)
+                ? CRGB::Black
+                : effect.color2;
+            m_leds[i] = trailColor;
         } else {
-            m_leds[i] = trailColor;     // 尾迹
+            // 光斑内：余弦插值从最亮到全灭
+            float t = dist / SPREAD;      // 0~1
+            brightness = (uint8_t)((0.5f * (1.0f + cosf(t * PI))) * 255.0f);
+            baseColor.nscale8(brightness);
+            m_leds[i] = baseColor;
+            baseColor = effect.color1;    // 重置
         }
     }
 }

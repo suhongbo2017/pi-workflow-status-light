@@ -84,7 +84,7 @@ CRGB StateMachine::colorNameToRGB(const String& name) {
     if (name == "cyan")     return CRGB(0, 255, 180); // 纯青色（减少蓝色分量）
     if (name == "magenta")  return CRGB::Magenta;
     if (name == "purple")   return CRGB(255, 0, 255);
-    if (name == "orange")   return CRGB::White; // 白色（与其他颜色明显区分）
+    if (name == "orange")   return CRGB(255, 165, 0); // 橙色
     if (name == "white")    return CRGB::White;
     if (name == "black")    return CRGB::Black;
     return CRGB::Blue; // 默认蓝色
@@ -111,7 +111,7 @@ LEDEffect StateMachine::getEffectForState(WorkflowState state) {
             effect.type = EffectType::CHASE;
             effect.color1 = CRGB::Yellow;   // 主色：黄色
             effect.color2 = CRGB(0, 0, 0);  // 尾迹：黑色（熄灭）
-            effect.periodMs = 600;          // 3颗灯珠，每颗200ms
+            effect.periodMs = 7200;         // 9颗灯珠渐变流动，完整一轮回绕约7.2秒
             break;
 
         case WorkflowState::WAITING:

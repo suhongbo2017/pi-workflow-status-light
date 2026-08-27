@@ -6,8 +6,7 @@
 #include "Config.h"
 #include "StateMachine.h"
 
-// 灯珠数量
-#define NUM_LEDS 3
+// 灯珠数量从 Config.h 的 NUM_LEDS 获取
 
 // LED 效果引擎
 class LEDEffectsEngine {
@@ -51,7 +50,6 @@ private:
 
     CRGB m_leds[NUM_LEDS];
     LEDEffect m_currentEffect;
-    unsigned long m_lastUpdateMs;
     bool m_useCustomColors;
     uint8_t m_globalBrightness;
 };

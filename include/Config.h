@@ -21,8 +21,9 @@
 // ====== 心跳间隔 ======
 #define HEARTBEAT_INTERVAL_MS 30000
 
-// ====== 引脚定义 ======
-#define NUM_LEDS 3
+// ====== 引脚定义 (ESP32-S3) ======
+// WS2812B DATA 线 → GPIO12
+#define NUM_LEDS 9
 #define LED_DATA_PIN 12
 
 #endif // CONFIG_H
